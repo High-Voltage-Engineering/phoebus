@@ -42,10 +42,15 @@ import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
+import javafx.scene.control.Control;
+import javafx.scene.control.TableRow;
+import javafx.scene.control.cell.PropertyValueFactory;
 import javafx.scene.control.cell.CheckBoxTableCell;
 import javafx.scene.control.cell.ComboBoxTableCell;
 import javafx.scene.control.cell.TextFieldTableCell;
 import javafx.scene.image.ImageView;
+import javafx.scene.input.Dragboard;
+import javafx.scene.input.TransferMode;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.Pane;
 import javafx.util.StringConverter;
@@ -67,11 +72,13 @@ import org.phoebus.framework.jobs.JobManager;
 import org.phoebus.framework.selection.SelectionService;
 import org.phoebus.ui.application.ContextMenuHelper;
 import org.phoebus.ui.dialog.ExceptionDetailsErrorDialog;
+import org.phoebus.ui.dnd.DataFormats;
 import org.phoebus.ui.javafx.FocusUtil;
 import org.phoebus.ui.javafx.ImageCache;
 import org.phoebus.util.time.TimestampFormats;
 
 import java.time.Instant;
+import java.util.*;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -195,6 +202,60 @@ public class ConfigurationController extends SaveAndRestoreBaseController implem
         pvTable.editableProperty().bind(userIdentity.isNull().not());
         pvTable.getSelectionModel().setSelectionMode(SelectionMode.MULTIPLE);
         pvTable.getSelectionModel().selectedItemProperty().addListener((obs, ov, nv) -> selectionEmpty.set(nv == null));
+
+        // indicate allowing drag drop for pv table and pv name fields
+        for (Control ctrl : new Control[] {pvTable, pvNameField, readbackPvNameField}) {
+            ctrl.setOnDragOver(event ->
+            {
+                if (event.getDragboard().hasString() ||
+                        event.getDragboard().hasContent(DataFormats.ProcessVariables)) {
+                    event.acceptTransferModes(TransferMode.COPY);
+                    event.consume();
+                }
+            });
+        }
+
+        // add dragged pvs to table with current readonly setting (and no readback)
+        // if one wishes to enter a readback, they can double click the added row to edit it,
+        // and even drag a readback pv to the proper text field
+        pvTable.setOnDragDropped(event -> {
+            final Dragboard db = event.getDragboard();
+            if (db.hasContent(DataFormats.ProcessVariables)) {   // Add PVs
+                @SuppressWarnings("unchecked") final List<ProcessVariable> pvs = (List<ProcessVariable>) db.getContent(DataFormats.ProcessVariables);
+                addPvs(pvs, Collections.emptyList(), readOnlyProperty.get());
+            } else if (db.hasString()) {   // Add new items from string
+                addPVsFromString(db.getString(), "", readOnlyProperty.get());
+            }
+        });
+
+        // enter row values in editor on double click
+        pvTable.setRowFactory(tv -> {
+            TableRow<ConfigPvEntry> row = new TableRow<>();
+            row.setOnMouseClicked(event -> {
+                if (event.getClickCount() == 2) {
+                    ConfigPv item = row.getItem().toConfigPv();
+                    pvNameField.setText(item.getPvName());
+                    readbackPvNameField.setText(item.getReadbackPvName());
+                    readOnlyCheckBox.setSelected(item.isReadOnly());
+                }
+            });
+            return row;
+        });
+
+        // allow drag drop on pv name fields
+        for (TextField field : new TextField[] {pvNameField, readbackPvNameField}) {
+            field.setOnDragDropped(event -> {
+                final Dragboard db = event.getDragboard();
+                if (db.hasContent(DataFormats.ProcessVariables)) {
+                    @SuppressWarnings("unchecked") final List<ProcessVariable> pvs = (List<ProcessVariable>) db.getContent(DataFormats.ProcessVariables);
+                    field.setText(pvs.stream().map(ProcessVariable::getName).collect(Collectors.joining("; ")));
+                } else if (db.hasString()) {
+                    field.setText(db.getString());
+                }
+            });
+        }
+
+        ContextMenu pvNameContextMenu = new ContextMenu();
 
         MenuItem deleteMenuItem = new MenuItem(Messages.menuItemDeleteSelectedPVs,
                 new ImageView(ImageCache.getImage(ConfigurationController.class, "/icons/delete.png")));
@@ -401,54 +462,64 @@ public class ConfigurationController extends SaveAndRestoreBaseController implem
         });
     }
 
-    @FXML
-    @SuppressWarnings("unused")
-    public void addPv() {
+    private void addPVsFromString(String pvString, String readbackPvString, boolean readonly) {
+        // Process a list of space or semicolon separated pvs
+        String[] pvNames = pvString.trim().split("[\\s;]+");
 
-        Platform.runLater(() -> {
-            // Process a list of space or semicolon separated pvs
-            String[] pvNames = pvNameProperty.get().trim().split("[\\s;]+");
-            String[] readbackPvNames = readbackPvNameProperty.get().trim().split("[\\s;]+");
+        List<ProcessVariable> pvs = Arrays.stream(pvNames).map(name -> new ProcessVariable(name.trim())).toList();
 
-            if (!checkForDuplicatePvNames(pvNames)) {
-                return;
-            }
 
-            ArrayList<ConfigPvEntry> configPVs = new ArrayList<>();
-            for (int i = 0; i < pvNames.length; i++) {
-                String pvName = pvNames[i].trim();
-                String readbackPV = i >= readbackPvNames.length ? null : readbackPvNames[i] == null || readbackPvNames[i].isEmpty() ? null : readbackPvNames[i].trim();
-                ConfigPv configPV = ConfigPv.builder()
-                        .pvName(pvName)
-                        .readOnly(readOnlyProperty.get())
-                        .readbackPvName(readbackPV)
-                        .build();
-                configPVs.add(new ConfigPvEntry(configPV));
-            }
-            configurationEntries.addAll(configPVs);
-            dirty.setValue(true);
-            resetAddPv();
-        });
+        String[] readbackPvNames = readbackPvString == null ? new String[]{} : readbackPvString.trim().split("[\\s;]+");
+        List<ProcessVariable> readbackPvs = Arrays.stream(readbackPvNames).map(name -> new ProcessVariable(name.trim())).toList();
+        addPvs(pvs, readbackPvs, readonly);
     }
 
-    /**
-     * Checks that added PV names are not added multiple times
-     *
-     * @param addedPvNames New PV names added in the UI
-     * @return <code>true</code> if no duplicates are detected, otherwise <code>false</code>
-     */
-    private boolean checkForDuplicatePvNames(String[] addedPvNames) {
-        List<String> pvNamesAsList = new ArrayList<>(Arrays.asList(addedPvNames));
-        pvTable.itemsProperty().get().forEach(i -> pvNamesAsList.add(i.getPvNameProperty().get()));
-        List<String> duplicatePvNames = pvNamesAsList.stream().filter(n -> Collections.frequency(pvNamesAsList, n) > 1).toList();
+    private void addPvs(List<ProcessVariable> pvs, List<ProcessVariable> readbackPvs, boolean readOnly) {
+        for (int i = 0; i < pvs.size(); i++) {
+            ProcessVariable pv = pvs.get(i);
 
-        if (!duplicatePvNames.isEmpty()) {
-            Alert alert = new Alert(Alert.AlertType.ERROR);
-            alert.setHeaderText(Messages.duplicatePVNamesNotSupported);
-            alert.showAndWait();
-            return false;
+            // Disallow duplicate PV names as in a restore operation this would mean that a PV is written
+            // multiple times, possibly with different values.
+            Optional<ConfigPvEntry> existing = configurationEntries.stream()
+                    .filter(s -> s.toConfigPv().getPvName().equals(pv.getName()))
+                    .findFirst();
+            String readbackPVName = i >= readbackPvs.size() ? null : readbackPvs.get(i) == null || readbackPvs.get(i).getName().isEmpty() ? null : readbackPvs.get(i).getName();
+
+            existing.ifPresentOrElse(configPvEntry -> {
+                // given PV already exists, update existing value
+                // we only want to mark the UI as being dirty if the values actually changed
+                ConfigPv configPV = configPvEntry.toConfigPv();
+                if (!Objects.equals(readbackPVName, configPV.getReadbackPvName())) {
+                    configPV.setReadbackPvName(readbackPVName);
+                    dirty.set(true);
+                }
+                if (readOnly != configPV.isReadOnly()) {
+                    configPV.setReadbackPvName(readbackPVName);
+                    dirty.set(true);
+                }
+                configPV.setReadOnly(readOnly);
+            }, () -> {
+                // create new PV
+                ConfigPv configPV = ConfigPv.builder()
+                        .pvName(pv.getName())
+                        .readOnly(readOnly)
+                        .readbackPvName(readbackPVName)
+                        .build();
+                configurationEntries.add(new ConfigPvEntry(configPV));
+                dirty.set(true);
+            });
         }
-        return true;
+
+        pvTable.setItems(configurationEntries);
+        pvTable.refresh();
+    }
+
+    @FXML
+    public void addPv() {
+        Platform.runLater(() -> {
+            addPVsFromString(pvNameProperty.get(), readbackPvNameProperty.get(), readOnlyProperty.get());
+            resetAddPv();
+        });
     }
 
     private void resetAddPv() {
